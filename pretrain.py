@@ -1,9 +1,11 @@
-from typing import Optional, Any, Sequence, List
+from typing import Optional, Any, Sequence, List, Dict
 from dataclasses import dataclass
 import os
 import math
 import yaml
 import shutil
+import signal
+import threading
 
 import torch
 import torch.distributed as dist
@@ -91,12 +93,36 @@ class TrainState:
 
     step: int
     total_steps: int
+    completed_iters: int = 0
 
 
-def create_dataloader(config: PretrainConfig, split: str, rank: int, world_size: int, **kwargs):
+_PREEMPT_EVENT = threading.Event()
+_PREEMPTION_HANDLED = threading.Event()
+
+
+def register_preemption_signal_handlers():
+    """Register signal handlers that request a graceful shutdown."""
+
+    def _handle_signal(signum, _frame):
+        print(f"Received signal {signum}. Requesting graceful shutdown...", flush=True)
+        _PREEMPT_EVENT.set()
+
+    for sig in (getattr(signal, "SIGUSR1", None), getattr(signal, "SIGTERM", None)):
+        if sig is not None:
+            signal.signal(sig, _handle_signal)
+
+
+def create_dataloader(
+    config: PretrainConfig, split: str, rank: int, world_size: int, *, initial_iters: int = 0, **kwargs
+):
     dataset = PuzzleDataset(
         PuzzleDatasetConfig(
-            seed=config.seed, dataset_path=config.data_path, rank=rank, num_replicas=world_size, **kwargs
+            seed=config.seed,
+            dataset_path=config.data_path,
+            rank=rank,
+            num_replicas=world_size,
+            initial_iters=initial_iters,
+            **kwargs,
         ),
         split=split,
     )
@@ -106,7 +132,9 @@ def create_dataloader(config: PretrainConfig, split: str, rank: int, world_size:
     return dataloader, dataset.metadata
 
 
-def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, rank: int, world_size: int):
+def create_model(
+    config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, rank: int, world_size: int
+):
     model_cfg = dict(
         **config.arch.__pydantic_extra__,  # type: ignore
         batch_size=config.global_batch_size // world_size,
@@ -120,15 +148,16 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, 
     model_cls = load_model_class(config.arch.name)
     loss_head_cls = load_model_class(config.arch.loss.name)
 
+    checkpoint_state = None
+
     with torch.device("cuda"):
         model: nn.Module = model_cls(model_cfg)
         model = loss_head_cls(model, **config.arch.loss.__pydantic_extra__)  # type: ignore
         if "DISABLE_COMPILE" not in os.environ:
             model = torch.compile(model, dynamic=False)  # type: ignore
 
-        # Load checkpoint
-        if rank == 0:
-            load_checkpoint(model, config)
+        # Load checkpoint (weights only or full train state)
+        checkpoint_state = load_checkpoint(model, config, rank=rank)
 
         # Broadcast parameters from rank 0
         if world_size > 1:
@@ -153,7 +182,7 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, 
     ]
     optimizer_lrs = [config.puzzle_emb_lr, config.lr]
 
-    return model, optimizers, optimizer_lrs
+    return model, optimizers, optimizer_lrs, checkpoint_state
 
 
 def cosine_schedule_with_warmup_lr_lambda(
@@ -187,9 +216,11 @@ def init_train_state(
     )
 
     # Model
-    model, optimizers, optimizer_lrs = create_model(config, train_metadata, rank=rank, world_size=world_size)
+    model, optimizers, optimizer_lrs, checkpoint_state = create_model(
+        config, train_metadata, rank=rank, world_size=world_size
+    )
 
-    return TrainState(
+    train_state = TrainState(
         step=0,
         total_steps=total_steps,
         model=model,
@@ -198,41 +229,108 @@ def init_train_state(
         carry=None,
     )
 
+    if checkpoint_state is not None:
+        if "optimizers" in checkpoint_state:
+            for optimizer, state_dict in zip(train_state.optimizers, checkpoint_state["optimizers"]):
+                optimizer.load_state_dict(state_dict)
+
+        train_state.step = int(checkpoint_state.get("step", train_state.step))
+        train_state.total_steps = int(checkpoint_state.get("total_steps", train_state.total_steps))
+        train_state.completed_iters = int(checkpoint_state.get("completed_iters", train_state.completed_iters))
+
+        if "torch_rng_state" in checkpoint_state:
+            torch.random.set_rng_state(checkpoint_state["torch_rng_state"])
+        if torch.cuda.is_available() and "cuda_rng_state" in checkpoint_state:
+            torch.cuda.set_rng_state(checkpoint_state["cuda_rng_state"])
+
+    return train_state
+
 
 def save_train_state(config: PretrainConfig, train_state: TrainState):
-    # FIXME: Only saved model.
     if config.checkpoint_path is None:
         return
 
     os.makedirs(config.checkpoint_path, exist_ok=True)
-    torch.save(
-        train_state.model.state_dict(), os.path.join(config.checkpoint_path, f"step_{train_state.step}")
+
+    state = {
+        "model": train_state.model.state_dict(),
+        "optimizers": [optimizer.state_dict() for optimizer in train_state.optimizers],
+        "step": train_state.step,
+        "total_steps": train_state.total_steps,
+        "completed_iters": train_state.completed_iters,
+        "torch_rng_state": torch.random.get_rng_state(),
+    }
+
+    if torch.cuda.is_available():
+        state["cuda_rng_state"] = torch.cuda.get_rng_state()
+
+    latest_tmp_path = os.path.join(config.checkpoint_path, "latest.pt.tmp")
+    latest_path = os.path.join(config.checkpoint_path, "latest.pt")
+    torch.save(state, latest_tmp_path)
+    os.replace(latest_tmp_path, latest_path)
+
+    # Keep per-step checkpoints for longer term storage.
+    step_tmp_path = os.path.join(
+        config.checkpoint_path, f"train_state_step_{train_state.step}.pt.tmp"
     )
+    step_path = os.path.join(config.checkpoint_path, f"train_state_step_{train_state.step}.pt")
+    shutil.copyfile(latest_path, step_tmp_path)
+    os.replace(step_tmp_path, step_path)
 
 
-def load_checkpoint(model: nn.Module, config: PretrainConfig):
-    if config.load_checkpoint is not None:
+def handle_preemption_if_requested(
+    config: PretrainConfig, train_state: TrainState, *, rank: int
+) -> bool:
+    if not _PREEMPT_EVENT.is_set():
+        return False
+
+    if not _PREEMPTION_HANDLED.is_set():
+        if rank == 0:
+            print(
+                f"Preemption detected at step {train_state.step}. Saving training state before exit...",
+                flush=True,
+            )
+            save_train_state(config, train_state)
+
+        _PREEMPTION_HANDLED.set()
+
+    return True
+
+
+def load_checkpoint(model: nn.Module, config: PretrainConfig, *, rank: int) -> Optional[Dict[str, Any]]:
+    if config.load_checkpoint is None:
+        return None
+
+    if rank == 0:
         print(f"Loading checkpoint {config.load_checkpoint}")
 
-        # Load state dict
-        state_dict = torch.load(config.load_checkpoint, map_location="cuda")
+    checkpoint = torch.load(config.load_checkpoint, map_location="cpu")
 
-        # Resize and reset puzzle emb if needed
-        puzzle_emb_name = "_orig_mod.model.inner.puzzle_emb.weights"
-        expected_shape: torch.Size = model.model.puzzle_emb.weights.shape  # type: ignore
-        if puzzle_emb_name in state_dict:
-            puzzle_emb = state_dict[puzzle_emb_name]
-            if puzzle_emb.shape != expected_shape:
+    if isinstance(checkpoint, dict) and "model" in checkpoint:
+        state_dict = checkpoint["model"].copy()
+    else:
+        state_dict = checkpoint.copy() if isinstance(checkpoint, dict) else checkpoint
+        checkpoint = None
+
+    # Resize and reset puzzle emb if needed
+    puzzle_emb_name = "_orig_mod.model.inner.puzzle_emb.weights"
+    expected_shape: torch.Size = model.model.puzzle_emb.weights.shape  # type: ignore
+    if isinstance(state_dict, dict) and puzzle_emb_name in state_dict:
+        puzzle_emb = state_dict[puzzle_emb_name]
+        if puzzle_emb.shape != expected_shape:
+            if rank == 0:
                 print(
                     f"Resetting puzzle embedding as shape is different. Found {puzzle_emb.shape}, Expected {expected_shape}"
                 )
 
-                # Re-initialize using mean
-                state_dict[puzzle_emb_name] = (
-                    torch.mean(puzzle_emb, dim=0, keepdim=True).expand(expected_shape).contiguous()
-                )
+            # Re-initialize using mean
+            state_dict[puzzle_emb_name] = (
+                torch.mean(puzzle_emb, dim=0, keepdim=True).expand(expected_shape).contiguous()
+            )
 
-        model.load_state_dict(state_dict, assign=True)
+    model.load_state_dict(state_dict, assign=True)
+
+    return checkpoint
 
 
 def compute_lr(base_lr: float, config: PretrainConfig, train_state: TrainState):
@@ -339,6 +437,9 @@ def evaluate(
 ):
     reduced_metrics = None
 
+    if handle_preemption_if_requested(config, train_state, rank=rank):
+        return reduced_metrics
+
     with torch.inference_mode():
         return_keys = set(config.eval_save_outputs)
         for evaluator in evaluators:
@@ -357,6 +458,9 @@ def evaluate(
         processed_batches = 0
         
         for set_name, batch, global_batch_size in eval_loader:
+            if _PREEMPT_EVENT.is_set():
+                break
+
             processed_batches += 1
             if rank == 0:
                 print(f"Processing batch {processed_batches}: {set_name}")
@@ -507,6 +611,12 @@ def load_synced_config(hydra_config: DictConfig, rank: int, world_size: int) -> 
         if config.checkpoint_path is None:
             config.checkpoint_path = os.path.join("checkpoints", config.project_name, config.run_name)
 
+        if config.load_checkpoint is None and config.checkpoint_path is not None:
+            latest_checkpoint = os.path.join(config.checkpoint_path, "latest.pt")
+            if os.path.exists(latest_checkpoint):
+                print(f"Found existing checkpoint at {latest_checkpoint}. Auto-resuming training.")
+                config.load_checkpoint = latest_checkpoint
+
         objects = [config]
 
     if world_size > 1:
@@ -536,6 +646,8 @@ def launch(hydra_config: DictConfig):
         assert (
             dist.get_rank(CPU_PROCESS_GROUP) == RANK and dist.get_world_size(CPU_PROCESS_GROUP) == WORLD_SIZE
         )
+
+    register_preemption_signal_handlers()
 
     # Load sync'ed config
     config = load_synced_config(hydra_config, rank=RANK, world_size=WORLD_SIZE)
@@ -581,10 +693,29 @@ def launch(hydra_config: DictConfig):
     # Train state
     train_state = init_train_state(config, train_metadata, rank=RANK, world_size=WORLD_SIZE)
 
+    if RANK == 0 and train_state.step > 0:
+        print(
+            f"Resumed training from step {train_state.step} (completed {train_state.completed_iters} iterations)."
+        )
+
+    if train_state.completed_iters > 0:
+        train_loader, _ = create_dataloader(
+            config,
+            "train",
+            test_set_mode=False,
+            epochs_per_iter=train_epochs_per_iter,
+            global_batch_size=config.global_batch_size,
+            rank=RANK,
+            world_size=WORLD_SIZE,
+            initial_iters=train_state.completed_iters,
+        )
+
     # Progress bar and logger
     progress_bar = None
     if RANK == 0:
         progress_bar = tqdm.tqdm(total=train_state.total_steps)
+        if train_state.step > 0:
+            progress_bar.update(train_state.step)
 
         wandb.init(
             project=config.project_name,
@@ -596,7 +727,15 @@ def launch(hydra_config: DictConfig):
         save_code_and_config(config)
 
     # Training Loop
+    preemption_triggered = False
     for _iter_id in range(total_iters):
+        if handle_preemption_if_requested(config, train_state, rank=RANK):
+            preemption_triggered = True
+            break
+
+        if _iter_id < train_state.completed_iters:
+            continue
+
         print(f"[Rank {RANK}, World Size {WORLD_SIZE}]: Epoch {_iter_id * train_epochs_per_iter}")
 
         ############ Train Iter
@@ -609,6 +748,13 @@ def launch(hydra_config: DictConfig):
             if RANK == 0 and metrics is not None:
                 wandb.log(metrics, step=train_state.step)
                 progress_bar.update(train_state.step - progress_bar.n)  # type: ignore
+
+            if handle_preemption_if_requested(config, train_state, rank=RANK):
+                preemption_triggered = True
+                break
+
+        if preemption_triggered:
+            break
 
         ############ Evaluation
         if eval_loader is not None and eval_metadata is not None:
@@ -627,9 +773,22 @@ def launch(hydra_config: DictConfig):
             if RANK == 0 and metrics is not None:
                 wandb.log(metrics, step=train_state.step)
 
+            if handle_preemption_if_requested(config, train_state, rank=RANK):
+                preemption_triggered = True
+                break
+
+        if preemption_triggered:
+            break
+
+        train_state.completed_iters = _iter_id + 1
+
         ############ Checkpointing
         if RANK == 0 and (config.checkpoint_every_eval or (_iter_id == total_iters - 1)):
             save_train_state(config, train_state)
+
+        if handle_preemption_if_requested(config, train_state, rank=RANK):
+            preemption_triggered = True
+            break
 
     # finalize
     if dist.is_initialized():

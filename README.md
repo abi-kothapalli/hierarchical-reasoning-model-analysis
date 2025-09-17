@@ -93,8 +93,12 @@ torchrun \
   --nproc_per_node $GPUS_PER_NODE \
   --rdzv_backend c10d \
   --rdzv_endpoint $MASTER_ADDR:$MASTER_PORT \
-  pretrain.py  
+  pretrain.py
 ```
+
+### Running on preemptible SLURM partitions
+
+When using a preemptible partition, submit `slurm_preempt.sh`. The script requests GPUs on the `preempt` partition, enables requeueing, and configures SLURM to send a `SIGUSR1` warning before the job is revoked. The training loop now installs signal handlers that checkpoint model weights, optimizer state, RNG state, and training progress whenever a preemption signal is received. When the job restarts, training will automatically resume from `checkpoints/<project>/<run>/latest.pt` if it exists.
 
 
 ### Change architecture to transformer
