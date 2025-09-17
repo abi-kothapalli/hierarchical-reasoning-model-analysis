@@ -49,6 +49,8 @@ class PuzzleDatasetConfig(pydantic.BaseModel):
     rank: int
     num_replicas: int
 
+    initial_iters: int = 0
+
 
 class PuzzleDataset(IterableDataset):
     def __init__(self, config: PuzzleDatasetConfig, split: str = "train"):
@@ -66,7 +68,7 @@ class PuzzleDataset(IterableDataset):
 
         # State
         self._data = None
-        self._iters = 0
+        self._iters = self.config.initial_iters
 
     def _load_metadata(self) -> PuzzleDatasetMetadata:
         with open(os.path.join(self.config.dataset_path, self.split, "dataset.json"), "r") as f:
